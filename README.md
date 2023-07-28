@@ -33,15 +33,19 @@ Why? Because it was FUN! Plus, I'm curious to see how the C and Rust versions wi
     ```
 
     You can also run `make rust` or `make rustfast` to get `run-rs` binary 
+
+## Full Llama2 Support 🚀🚀
+We can now run the full llama2-7B!!  No memory mapping for now, so all the weights must fit in memory (~26Gb). On my codespaces VM with 16 cores and 64Gb memory, the inference runs at 1.4 tokens per second.
+
+
 ## Performance
 
 Hacky tokens/sec measurement on dev VM (16 cores/64G mem).
 
-|    tok/s   | 15M | 42M | 110M
-|-------|-----|-----|-----|
-| 1 core|  ~75|   ~25   | ~10
-| 12 cores |  ~310   |  ~110   | ~65
-
+|    tok/s   | 15M | 42M | 110M | 7B
+|-------|-----|-----|-----|-----|
+| single core|  ~75|   ~25   | ~10 | 🙅‍♂️
+| core per head |  ~310   |  ~110   | ~65| 1.4
 
 
 ## Keeping up with the original
@@ -50,7 +54,7 @@ I'm pretty sure that `llama2.c` is going to move fast and get lots of contributi
 So any contribution is welcome here!
 
 ### Contribution Ideas
-- Parallelize attention over heads
+- memory map weights
 - WASM port?
 - fuse QKV matmuls to a single matmul
 

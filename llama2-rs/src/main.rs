@@ -23,6 +23,7 @@ struct Config {
     n_kv_heads: usize,
     vocab_size: usize,
     seq_len: usize,
+    shared_weights: bool,
 }
 
 impl Config {
@@ -33,14 +34,21 @@ impl Config {
         let mut buffer = [0; CONF_SIZE];
         model_bin.read_exact(&mut buffer).unwrap();
         let raw_conf = unsafe { mem::transmute::<[u8; CONF_SIZE], [i32; CONF_VALS]>(buffer) };
+        let (vocab_size, shared_weights) = if raw_conf[5] < 0 {
+            (-raw_conf[5] as usize, true)
+        } else {
+            (raw_conf[5] as usize, false)
+        };
+
         Self {
             dim: raw_conf[0] as usize,
             hidden_dim: raw_conf[1] as usize,
             n_layers: raw_conf[2] as usize,
             n_heads: raw_conf[3] as usize,
             n_kv_heads: raw_conf[4] as usize,
-            vocab_size: raw_conf[5] as usize,
+            vocab_size,
             seq_len: raw_conf[6] as usize,
+            shared_weights,
         }
     }
 }
@@ -58,7 +66,7 @@ impl Vocab {
             File::open(path).expect(format!("Couldn't find tokenizer file at {}", path).as_str());
         let mut len = [0; 4];
         let mut val = [0; 1];
-        for _ in 0..vocab_size {
+        for vs in 0..vocab_size {
             vocab_bin.read_exact(&mut len).unwrap();
             let l = unsafe { mem::transmute::<[u8; 4], i32>(len) };
             offsets.push(offsets.last().unwrap() + l as usize);
@@ -114,12 +122,15 @@ struct TransformerWeights {
     freq_cis_real: Vec<Ty>,
     /// (seq_len, dim/2)
     freq_cis_imag: Vec<Ty>,
+    /// Last layer classifier: (vocab_size, dim)
+    wcls: Option<Vec<Ty>>,
 }
 
 fn _alloc_and_read(file: &mut File, size: usize) -> Vec<Ty> {
     let bytes_to_read = size * std::mem::size_of::<Ty>();
     let mut raw_w_data = vec![0; bytes_to_read];
-    file.read_exact(&mut raw_w_data).unwrap();
+    file.read_exact(&mut raw_w_data)
+        .expect("Failed to read weights file");
     unsafe {
         let float_ptr = raw_w_data.as_ptr() as *const Ty;
         let data = std::slice::from_raw_parts(float_ptr, size);
@@ -130,7 +141,11 @@ fn _alloc_and_read(file: &mut File, size: usize) -> Vec<Ty> {
 impl TransformerWeights {
     fn read_from_file(cfg: &Config, path: &str) -> Self {
         let mut model_bin = File::open(path).unwrap();
+        let mut bytes_left = model_bin.metadata().unwrap().len() as usize;
+
         model_bin.seek(SeekFrom::Start(CONF_SIZE as u64)).unwrap();
+        bytes_left -= CONF_SIZE;
+
         let mut f = |s: usize| _alloc_and_read(&mut model_bin, s);
         let head_size = cfg.dim / cfg.n_heads;
         Self {
@@ -147,6 +162,7 @@ impl TransformerWeights {
             rms_final_weight: f(cfg.dim),
             freq_cis_real: f(cfg.seq_len * (head_size / 2)),
             freq_cis_imag: f(cfg.seq_len * (head_size / 2)),
+            wcls: cfg.shared_weights.then_some(f(cfg.vocab_size * cfg.dim)),
         }
     }
 }
@@ -387,8 +403,7 @@ impl RunState {
             .next()
             .unwrap();
 
-        
-        let attn_lambda =|h| {
+        let attn_lambda = |h| {
             let q = _uncheked_slice(&self.q, h * head_size, head_size);
 
             // Brutishly force xb to be mutable slice
@@ -418,8 +433,6 @@ impl RunState {
 
         #[cfg(not(feature = "parallel"))]
         (0..cfg.n_heads).for_each(attn_lambda);
-
-        
     }
 
     fn ffn(&mut self, l: usize, w: &TransformerWeights, cfg: &Config) {
@@ -502,7 +515,11 @@ impl RunState {
             .zip(w.rms_final_weight.iter())
             .for_each(|(xx, ww)| (*xx) *= ww * ss);
 
-        matmul(&mut self.logits, &self.x, &w.token_embedding_table, cfg.dim);
+        if let Some(wcls) = &w.wcls {
+            matmul(&mut self.logits, &self.x, wcls, cfg.dim);
+        } else {
+            matmul(&mut self.logits, &self.x, &w.token_embedding_table, cfg.dim);
+        }
     }
 }
 
@@ -515,9 +532,12 @@ fn main() {
         v.parse::<Ty>().expect("temperature must be a float")
     });
 
+
     let tokenizer_path = "tokenizer.bin";
 
     let config = Config::from_file(&model_path);
+    let seq_len = env::args().nth(3).map_or(config.seq_len, |v| v.parse::<usize>().expect("Sequence len must be integer"));
+    
 
     #[cfg(feature = "parallel")]
     {
@@ -533,7 +553,10 @@ fn main() {
     }
 
     let vocab = Vocab::from_file(config.vocab_size, tokenizer_path);
+    let st = Instant::now();
     let weights = TransformerWeights::read_from_file(&config, &model_path);
+    println!("--> [Loaded weights in {} secs]\n\n", st.elapsed().as_secs());
+
     let mut benches = vec![];
     for _ in 0..1 {
         let mut state = RunState::init(&config);
@@ -542,7 +565,7 @@ fn main() {
         let st = Instant::now();
         let mut pos = 0;
         let mut token = 1;
-        while pos < config.seq_len {
+        while pos < seq_len {
             state.step(token, pos, &weights, &config);
             let next = if temperature == 0 as Ty {
                 state
@@ -574,4 +597,3 @@ fn main() {
 
     println!("\n{:.3} Tokens/Sec", ts);
 }
-
