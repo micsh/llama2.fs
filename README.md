@@ -16,6 +16,7 @@ Why? Because it was FUN! Plus, I'm curious to see how the C and Rust versions wi
     ```bash
     wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
     wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories42M.bin
+    wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin
     ```
 2. Make sure you have the tokenizer binary - `tokenizer.bin` (if not see [tokenizer.py](tokenizer.py))
 3. Compile and run the Rust code
@@ -52,7 +53,6 @@ So any contribution is welcome here!
 - Parallelize attention over heads
 - WASM port?
 - fuse QKV matmuls to a single matmul
-
 
 ## License
 MIT

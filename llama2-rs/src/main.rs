@@ -553,19 +553,6 @@ impl RunState {
 }
 
 fn main() {
-    #[cfg(feature = "parallel")]
-    {
-        use num_cpus;
-        let cpus = num_cpus::get();
-        let active_cpus = (cpus >> 2) * 3; // use 75% of available cores
-        println!("--> [Running Inference on {} CPUs]\n\n", active_cpus);
-
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(active_cpus)
-            .build_global()
-            .unwrap();
-    }
-
     use std::env;
     use std::time::Instant;
 
@@ -577,6 +564,20 @@ fn main() {
     let tokenizer_path = "tokenizer.bin";
 
     let config = Config::from_file(&model_path);
+
+    #[cfg(feature = "parallel")]
+    {
+        use num_cpus;
+        let cpus = num_cpus::get();
+        let active_cpus = (cpus - 1).max(1).min(config.n_heads); // use 75% of available cores
+        println!("--> [Running Inference on {} CPUs]\n\n", active_cpus);
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(active_cpus)
+            .build_global()
+            .unwrap();
+    }
+
     let vocab = Vocab::from_file(config.vocab_size, tokenizer_path);
     let weights = TransformerWeights::read_from_file(&config, &model_path);
     let mut benches = vec![];
@@ -619,3 +620,4 @@ fn main() {
 
     println!("\n{:.3} Tokens/Sec", ts);
 }
+

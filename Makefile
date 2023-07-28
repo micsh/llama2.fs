@@ -43,5 +43,6 @@ rust:
 
 .PHONY:rustfast 
 rustfast:
+	RUSTFLAGS="-C target-cpu=native -C llvm-args=-cost-kind=latency" 
 	cargo build --release -F parallel
 	mv target/release/llama2-rs ./run-rs
