@@ -10,6 +10,9 @@ This is a quick-and-dirty first attempt.
 
 Why? Because it was FUN! Plus, I'm curious to see how the C and Rust versions will evolve differently.
 
+## Full Llama2 Support 🚀🚀
+We can now run the full **llama2-7B**!!  No memory mapping for now, so all the weights must fit in memory (~26Gb). On my codespaces VM with 16 cores and 64Gb memory, the inference runs at 1.4 tokens per second.
+
 ## How to run?
 1. Grab Karpathy's baby Llama2 ([Orig instructions](https://github.com/karpathy/llama2.c#feel-the-magic)) pretrained on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset 
 
@@ -33,9 +36,6 @@ Why? Because it was FUN! Plus, I'm curious to see how the C and Rust versions wi
     ```
 
     You can also run `make rust` or `make rustfast` to get `run-rs` binary 
-
-## Full Llama2 Support 🚀🚀
-We can now run the full llama2-7B!!  No memory mapping for now, so all the weights must fit in memory (~26Gb). On my codespaces VM with 16 cores and 64Gb memory, the inference runs at 1.4 tokens per second.
 
 
 ## Performance
