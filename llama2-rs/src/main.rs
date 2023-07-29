@@ -91,7 +91,50 @@ impl Vocab {
 // generic placeholder
 type Ty = f32;
 
-struct TransformerWeights {
+struct Q8Vec {
+    factor: Ty,
+    vals: Vec<i8>,
+}
+
+impl Q8Vec {
+    fn dot(&self, other: &Self) -> Ty {
+        let common_fact = self.factor * other.factor;
+        self.vals
+            .iter()
+            .zip(other.vals.iter())
+            .map(|(x, y)| (x * y) as Ty)
+            .fold(0 as Ty, |acc, v| v * common_fact)
+    }
+
+    fn quantize(vec: &[Ty]) -> Self {
+        let rmax = vec.iter().fold(Ty::NAN, |acc, &v| acc.max(v.abs()));
+        let inv_factor = i8::MAX as Ty / rmax;
+        let vals = vec.iter().map(|v| (v * inv_factor).round() as i8);
+        Self {
+            factor: 1 as Ty / inv_factor,
+            vals: vals.collect(),
+        }
+    }
+
+    /// Quantize row wise, takes array of [L, d1, d2] Ty return [L, d1] Q_8Row
+    fn quantize_3d(data: &[Ty], layers: usize, rows: usize, cols: usize) -> Vec<Self> {
+        let mut out = Vec::with_capacity(layers * rows);
+        for layer_mat in data.chunks_exact(rows * cols) {
+            for row in layer_mat.chunks_exact(cols) {
+                let rmax = row.iter().fold(Ty::NAN, |acc, &v| acc.max(v.abs()));
+                let inv_factor = i8::MAX as Ty / rmax;
+                let vals = row.iter().map(|v| (v * inv_factor).round() as i8);
+                out.push(Self {
+                    factor: 1 as Ty / inv_factor,
+                    vals: vals.collect(),
+                })
+            }
+        }
+        out
+    }
+}
+
+struct TransformerWeights<Q> {
     /// (vocab_size, dim)
     token_embedding_table: Vec<Ty>,
     /// (layer, dim) rmsnorm weights
@@ -100,20 +143,20 @@ struct TransformerWeights {
     rms_ffn_weight: Vec<Ty>,
     // weights for matmuls
     /// (layer, dim, dim)
-    wq: Vec<Ty>,
+    wq: Vec<Q>,
     /// (layer, dim, dim)
-    wk: Vec<Ty>,
+    wk: Vec<Q>,
     /// (layer, dim, dim)
-    wv: Vec<Ty>,
+    wv: Vec<Q>,
     /// (layer, dim, dim)
-    wo: Vec<Ty>,
+    wo: Vec<Q>,
     // weights for ffn
     /// (layer, hidden_dim, dim)
-    w1: Vec<Ty>,
+    w1: Vec<Q>,
     /// (layer, dim, hidden_dim)
-    w2: Vec<Ty>,
+    w2: Vec<Q>,
     /// (layer, hidden_dim, dim)
-    w3: Vec<Ty>,
+    w3: Vec<Q>,
     // final rmsnorm
     /// (dim,)
     rms_final_weight: Vec<Ty>,
@@ -138,31 +181,76 @@ fn _alloc_and_read(file: &mut File, size: usize) -> Vec<Ty> {
     }
 }
 
-impl TransformerWeights {
-    fn read_from_file(cfg: &Config, path: &str) -> Self {
+impl<Q> TransformerWeights<Q> {
+    fn _alloc_vecs(cfg: &Config, path: &str) -> ([Vec<Ty>; 13], Option<Vec<Ty>>) {
         let mut model_bin = File::open(path).unwrap();
-        let mut bytes_left = model_bin.metadata().unwrap().len() as usize;
 
         model_bin.seek(SeekFrom::Start(CONF_SIZE as u64)).unwrap();
-        bytes_left -= CONF_SIZE;
 
         let mut f = |s: usize| _alloc_and_read(&mut model_bin, s);
         let head_size = cfg.dim / cfg.n_heads;
+        (
+            [
+                f(cfg.vocab_size * cfg.dim),
+                f(cfg.n_layers * cfg.dim),
+                f(cfg.n_layers * cfg.dim * cfg.dim),
+                f(cfg.n_layers * cfg.dim * cfg.dim),
+                f(cfg.n_layers * cfg.dim * cfg.dim),
+                f(cfg.n_layers * cfg.dim * cfg.dim),
+                f(cfg.n_layers * cfg.dim),
+                f(cfg.n_layers * cfg.dim * cfg.hidden_dim),
+                f(cfg.n_layers * cfg.dim * cfg.hidden_dim),
+                f(cfg.n_layers * cfg.dim * cfg.hidden_dim),
+                f(cfg.dim),
+                f(cfg.seq_len * (head_size / 2)),
+                f(cfg.seq_len * (head_size / 2)),
+            ],
+            cfg.shared_weights.then(|| f(cfg.vocab_size * cfg.dim)),
+        )
+    }
+}
+
+impl TransformerWeights<Ty> {
+    fn read_from_file(cfg: &Config, path: &str) -> Self {
+        let (vecs, wcls) = Self::_alloc_vecs(cfg, path);
+
         Self {
-            token_embedding_table: f(cfg.vocab_size * cfg.dim),
-            rms_att_weight: f(cfg.n_layers * cfg.dim),
-            wq: f(cfg.n_layers * cfg.dim * cfg.dim),
-            wk: f(cfg.n_layers * cfg.dim * cfg.dim),
-            wv: f(cfg.n_layers * cfg.dim * cfg.dim),
-            wo: f(cfg.n_layers * cfg.dim * cfg.dim),
-            rms_ffn_weight: f(cfg.n_layers * cfg.dim),
-            w1: f(cfg.n_layers * cfg.dim * cfg.hidden_dim),
-            w2: f(cfg.n_layers * cfg.dim * cfg.hidden_dim),
-            w3: f(cfg.n_layers * cfg.dim * cfg.hidden_dim),
-            rms_final_weight: f(cfg.dim),
-            freq_cis_real: f(cfg.seq_len * (head_size / 2)),
-            freq_cis_imag: f(cfg.seq_len * (head_size / 2)),
-            wcls: cfg.shared_weights.then_some(f(cfg.vocab_size * cfg.dim)),
+            token_embedding_table: vecs[0].to_owned(),
+            rms_att_weight: vecs[1].to_owned(),
+            wq: vecs[2].to_owned(),
+            wk: vecs[3].to_owned(),
+            wv: vecs[4].to_owned(),
+            wo: vecs[5].to_owned(),
+            rms_ffn_weight: vecs[6].to_owned(),
+            w1: vecs[7].to_owned(),
+            w2: vecs[8].to_owned(),
+            w3: vecs[9].to_owned(),
+            rms_final_weight: vecs[10].to_owned(),
+            freq_cis_real: vecs[11].to_owned(),
+            freq_cis_imag: vecs[12].to_owned(),
+            wcls,
+        }
+    }
+}
+
+impl TransformerWeights<Q8Vec> {
+    fn read_from_file(cfg: &Config, path: &str) -> Self {
+        let (vecs, wcls) = Self::_alloc_vecs(cfg, path);
+        Self {
+            token_embedding_table: vecs[0].to_owned(),
+            rms_att_weight: vecs[1].to_owned(),
+            wq: Q8Vec::quantize_3d(&vecs[2], cfg.n_layers, cfg.dim, cfg.dim),
+            wk: Q8Vec::quantize_3d(&vecs[3], cfg.n_layers, cfg.dim, cfg.dim),
+            wv: Q8Vec::quantize_3d(&vecs[4], cfg.n_layers, cfg.dim, cfg.dim),
+            wo: Q8Vec::quantize_3d(&vecs[5], cfg.n_layers, cfg.dim, cfg.dim),
+            rms_ffn_weight: vecs[6].to_owned(),
+            w1: Q8Vec::quantize_3d(&vecs[7], cfg.n_layers, cfg.hidden_dim, cfg.dim),
+            w2: Q8Vec::quantize_3d(&vecs[8], cfg.n_layers, cfg.dim, cfg.hidden_dim),
+            w3: Q8Vec::quantize_3d(&vecs[9], cfg.n_layers, cfg.hidden_dim, cfg.dim),
+            rms_final_weight: vecs[10].to_owned(),
+            freq_cis_real: vecs[11].to_owned(),
+            freq_cis_imag: vecs[12].to_owned(),
+            wcls,
         }
     }
 }
@@ -202,6 +290,12 @@ fn rmsnorm(out: &mut [Ty], x: &[Ty], w: &[Ty]) {
     out.iter_mut().zip(normed).for_each(|(dst, src)| *dst = src);
 }
 
+fn matmul_q8_ty(out: &mut [Ty], x: &Q8Vec, w: &[Q8Vec]) {
+    out.iter_mut().enumerate().for_each(|(i, out_val)| {
+        *out_val = unsafe { w.get_unchecked(i).dot(x) };
+    });
+}
+
 /// For now this is a matvec
 /// Wx: [n, d]x[d,] -> [n,]
 #[cfg(feature = "parallel")]
@@ -233,7 +327,7 @@ fn _uncheked_mut_slice(s: &[Ty], offset: usize, size: usize) -> &mut [Ty] {
     }
 }
 
-fn _uncheked_slice(s: &[Ty], offset: usize, size: usize) -> &[Ty] {
+fn _uncheked_slice<Q>(s: &[Q], offset: usize, size: usize) -> &[Q] {
     let ptr = s.as_ptr();
     unsafe {
         let st = ptr.add(offset);
@@ -339,7 +433,7 @@ impl RunState {
         }
     }
 
-    fn qkv_for_layer(&mut self, l: usize, w: &TransformerWeights, dim: usize) {
+    fn qkv_for_layer(&mut self, l: usize, w: &TransformerWeights<Ty>, dim: usize) {
         let wq = _uncheked_slice(&w.wq, l * dim * dim, dim * dim);
         let wk = _uncheked_slice(&w.wk, l * dim * dim, dim * dim);
         let wv = _uncheked_slice(&w.wv, l * dim * dim, dim * dim);
@@ -358,7 +452,7 @@ impl RunState {
         vc.copy_from_slice(&self.v);
     }
 
-    fn rope(&mut self, pos: usize, w: &TransformerWeights, n_heads: usize, dim: usize) {
+    fn rope(&mut self, pos: usize, w: &TransformerWeights<Ty>, n_heads: usize, dim: usize) {
         let head_size = dim / n_heads;
         let qk_heads = self
             .q
@@ -435,7 +529,7 @@ impl RunState {
         (0..cfg.n_heads).for_each(attn_lambda);
     }
 
-    fn ffn(&mut self, l: usize, w: &TransformerWeights, cfg: &Config) {
+    fn ffn(&mut self, l: usize, w: &TransformerWeights<Ty>, cfg: &Config) {
         let rms_ffn_w = _uncheked_slice(&w.rms_ffn_weight, l * cfg.dim, cfg.dim);
         // normalize after adding residual
         rmsnorm(&mut self.xb, &self.x, rms_ffn_w);
@@ -471,7 +565,7 @@ impl RunState {
         matmul(&mut self.xb, &self.hb, w2, cfg.hidden_dim);
     }
 
-    fn step(&mut self, token: usize, pos: usize, w: &TransformerWeights, cfg: &Config) {
+    fn step(&mut self, token: usize, pos: usize, w: &TransformerWeights<Ty>, cfg: &Config) {
         // copy content row
         // TODO: mayne direct indexing w/o bound checks is faster? benchmark
         w.token_embedding_table
@@ -532,18 +626,18 @@ fn main() {
         v.parse::<Ty>().expect("temperature must be a float")
     });
 
-
     let tokenizer_path = "tokenizer.bin";
 
     let config = Config::from_file(&model_path);
-    let seq_len = env::args().nth(3).map_or(config.seq_len, |v| v.parse::<usize>().expect("Sequence len must be integer"));
-    
+    let seq_len = env::args().nth(3).map_or(config.seq_len, |v| {
+        v.parse::<usize>().expect("Sequence len must be integer")
+    });
 
     #[cfg(feature = "parallel")]
     {
         use num_cpus;
         let cpus = num_cpus::get();
-        let active_cpus = (cpus - 1).max(1).min(config.n_heads); // use 75% of available cores
+        let active_cpus = (cpus).max(1).min(config.n_heads); // use 75% of available cores
         println!("--> [Running Inference on {} CPUs]\n\n", active_cpus);
 
         rayon::ThreadPoolBuilder::new()
@@ -554,8 +648,11 @@ fn main() {
 
     let vocab = Vocab::from_file(config.vocab_size, tokenizer_path);
     let st = Instant::now();
-    let weights = TransformerWeights::read_from_file(&config, &model_path);
-    println!("--> [Loaded weights in {} secs]\n\n", st.elapsed().as_secs());
+    let weights = TransformerWeights::<Ty>::read_from_file(&config, &model_path);
+    println!(
+        "--> [Loaded weights in {} secs]\n\n",
+        st.elapsed().as_secs()
+    );
 
     let mut benches = vec![];
     for _ in 0..1 {
