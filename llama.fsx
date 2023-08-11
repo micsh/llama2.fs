@@ -183,6 +183,7 @@ type Config = {
     n_kv_heads: int
     vocab_size: int
     seq_len: int
+    shared_weights: bool
 }
 
 let inline _attention_head (q: memory) (xb: memory) (layer_cached_keys: memory) (layer_cached_vals: memory) (att: memory) pos (cfg:Config) =
@@ -361,22 +362,21 @@ let read_config_and_weights path =
     use stream = System.IO.File.OpenRead(path)
     use reader = new System.IO.BinaryReader(stream)
     
-    let cfg = { 
-        dim = reader.ReadInt32()
-        hidden_dim = reader.ReadInt32()
-        n_layers = reader.ReadInt32()
-        n_heads = reader.ReadInt32()
-        n_kv_heads = reader.ReadInt32()
-        vocab_size = Math.Abs(reader.ReadInt32())
-        seq_len = reader.ReadInt32()
-    }
+    let cfg = match ({ 
+                    dim = reader.ReadInt32()
+                    hidden_dim = reader.ReadInt32()
+                    n_layers = reader.ReadInt32()
+                    n_heads = reader.ReadInt32()
+                    n_kv_heads = reader.ReadInt32()
+                    vocab_size = reader.ReadInt32()
+                    seq_len = reader.ReadInt32()
+                    shared_weights = false
+                }) with 
+                | c when c.vocab_size >= 0 -> c 
+                | c -> { c with vocab_size = -c.vocab_size; shared_weights = true }
 
     let read size =
-        let bytes = reader.ReadBytes(size * sizeof<float32>)
-        let floats = Array.zeroCreate<float32>(size)
-        Buffer.BlockCopy(bytes, 0, floats, 0, bytes.Length)
-        memory(floats)
-        //[| for i in 0..size - 1 -> reader.ReadSingle() |]
+        memory [| for i in 0..size - 1 -> reader.ReadSingle() |]
 
     let head_size = cfg.dim / cfg.n_heads
 
@@ -394,7 +394,7 @@ let read_config_and_weights path =
         rms_final_weight = read (cfg.dim)
         freq_cis_real = read (cfg.seq_len * (head_size / 2))
         freq_cis_imag = read (cfg.seq_len * (head_size / 2))
-        wcls = None
+        wcls = if cfg.shared_weights then Some (read (cfg.vocab_size * cfg.dim)) else None
     }
 
 let cfg, weights = read_config_and_weights @"stories110M.bin"
