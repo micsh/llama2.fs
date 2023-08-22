@@ -10,35 +10,27 @@ module Vectorized =
     type vec = Vector<float32>
     let vcount = vec.Count
 
-    //let inline accelerate len vecmap map =
-    //    let mutable i = 0
-    //    while i <= len-vcount do
-    //        vecmap i
-    //        i <- i + vcount
-
-    //    i <- len-len%vcount   
-    //    while i < len do
-    //        map i
-    //        i <- i + 1
+    let inline (<<<) (out: span) (x: vec) = x.CopyTo(out)
 
     let inline max (x: span) =
         let len = x.Length
         let mutable max = x[0]
-        
+        let mutable MAX = vec(max)
+
         let mutable i = 0
-        let mutable maxV = vec(max)
         if len >= vcount then
             while i <= len-vcount do
-               maxV <- Vector.Max(vec(x.Slice(i)), maxV)
+               MAX <- Vector.Max(vec(x.Slice(i)), MAX)
                i <- i + vcount
 
             for j in 0..vcount-1 do
-                if maxV[j] > max then max <- maxV[j]
+                if MAX[j] > max then max <- MAX[j]
     
         i <- len-len%vcount
         while i < len do
             if x[i] > max then max <- x[i]
             i <- i + 1
+
         max
 
     let inline dot (x : span) (w : span) =
@@ -63,7 +55,7 @@ module Vectorized =
 
         let mutable i = 0
         while i <= len-vcount do
-            (vec(x.Slice(i)) + vec(y.Slice(i))).CopyTo(out.Slice(i))
+            out.Slice(i) <<< vec(x.Slice(i)) + vec(y.Slice(i))
             i <- i + vcount
 
         i <- len-len%vcount   
@@ -76,7 +68,7 @@ module Vectorized =
         let len = x.Length
         let mutable i = 0
         while i <= len-vcount do
-            (vec(out.Slice(i)) + vec(x.Slice(i)) * vec(k)).CopyTo(out.Slice(i))
+            out.Slice(i) <<< vec(out.Slice(i)) + vec(x.Slice(i)) * k
             i <- i + vcount
 
         i <- len-len%vcount   
@@ -90,7 +82,7 @@ module Vectorized =
     
         let mutable i = 0
         while i <= len-vcount do
-            (vec(out.Slice(i)) * x).CopyTo(out.Slice(i))
+            out.Slice(i) <<< vec(out.Slice(i)) * x
             i <- i + vcount
             
         i <- len-len%vcount   
@@ -104,7 +96,7 @@ module Vectorized =
 
         let mutable i = 0
         while i <= len-vcount do
-            (vec(x.Slice(i)) * vec(y.Slice(i))).CopyTo(out.Slice(i))
+            out.Slice(i) <<< vec(x.Slice(i)) * vec(y.Slice(i))
             i <- i + vcount
 
         i <- len-len%vcount
@@ -113,43 +105,19 @@ module Vectorized =
             i <- i + 1
 
 module Span =
-    //let inline max (x : span) =
-    //    let mutable max = x[0]
-
-    //    for i in 1..x.Length - 1 do
-    //        if x[i] > max then
-    //            max <- x[i]
-
-    //    max
-
     let inline maxi (x : span) =
         let mutable max = x[0]
         let mutable index = 0
 
-        for i in 1..x.Length - 1 do
+        let mutable i = 1
+        while i < x.Length do
             if x[i] > max then
                 max <- x[i]
                 index <- i
+            i <- i + 1
 
         index
 
-    //let inline add (out: span) (x: span) (y: span) =
-    //    for i in 0..x.Length - 1 do
-    //        out[i] <- x[i] + y[i]
-
-    //let inline mult_scalar (out: span) x =
-    //    for i in 0..out.Length - 1 do
-    //        out[i] <- out[i] * x
-
-    //let inline mult (out: span) (x: span) (y: span) =
-    //    for i in 0..x.Length - 1 do
-    //        out[i] <- x[i] * y[i]
-
-    //let inline dot (x: span) (w: span) =
-    //    let mutable s = 0f
-    //    for i in 0..x.Length - 1 do
-    //        s <- s + x[i] * w[i]
-    //    s
 
 // --------------------------------------------------------------------------------------------------------------
 
@@ -161,16 +129,17 @@ let rmsnorm (out: span) (x: span) (w: span) =
 
 let matmul (out: memory) (x: memory) (w: memory) =
     let len = x.Length
-    let parts = w.Length / len
-    Parallel.For(0, parts, fun i -> out.Span[i] <- Vectorized.dot x.Span (w.Slice(i * len, len).Span)) |> ignore
+    Parallel.For(0, w.Length / len, fun i -> out.Span[i] <- Vectorized.dot x.Span (w.Slice(i * len, len).Span)) |> ignore
 
 let inplace_softmax (x: span) =
     let maxx = Vectorized.max x
 
     let mutable denom = 0f
-    for i in 0..x.Length-1 do
+    let mutable i = 0
+    while i < x.Length do
         x[i] <- exp(x[i] - maxx)
         denom <- denom + x[i]
+        i <- i + 1
 
     Vectorized.scale x (1f / denom)
 
@@ -185,22 +154,6 @@ type Config = {
     seq_len: int
     shared_weights: bool
 }
-
-let inline _attention_head (q: memory) (xb: memory) (layer_cached_keys: memory) (layer_cached_vals: memory) (att: memory) pos (cfg:Config) =
-    let head_size = cfg.dim / cfg.n_heads
-
-    let multi = 1f / sqrt(float32 head_size)
-    Parallel.For(0, pos + 1, fun t -> 
-                                let k = layer_cached_keys.Slice(t * cfg.dim, head_size).Span
-                                att.Span[t] <- (Vectorized.dot k q.Span) * multi) |> ignore
-
-    inplace_softmax (att.Slice(0, pos+1).Span)
-    xb.Span.Clear()
-
-    Parallel.For(0, pos + 1, fun t ->
-                                let v = layer_cached_vals.Slice(t * head_size * cfg.n_heads, head_size).Span
-                                let attn_w = att.Span[t]
-                                Vectorized.addscaled xb.Span v attn_w) |> ignore
 
 type TransformerWeights = {
     /// (vocab_size, dim)
@@ -255,10 +208,13 @@ type RunState(cfg: Config, weights: TransformerWeights) =
     let key_cache = allocate (cfg.n_layers * cfg.seq_len * cfg.dim) // (layer, seq_len, dim)
     let value_cache = allocate (cfg.n_layers * cfg.seq_len * cfg.dim) // (layer, seq_len, dim)
 
-    let qkv_for_layer l =
-        let wq = weights.wq.Slice(l * cfg.dim * cfg.dim, cfg.dim * cfg.dim)
-        let wk = weights.wk.Slice(l * cfg.dim * cfg.dim, cfg.dim * cfg.dim)
-        let wv = weights.wv.Slice(l * cfg.dim * cfg.dim, cfg.dim * cfg.dim)
+    let qkv_for_layer layer =
+        let offset = layer * cfg.dim * cfg.dim
+        let length = cfg.dim * cfg.dim
+
+        let wq = weights.wq.Slice(offset, length)
+        let wk = weights.wk.Slice(offset, length)
+        let wv = weights.wv.Slice(offset, length)
         
         matmul q xb wq
         matmul k xb wk
@@ -266,8 +222,10 @@ type RunState(cfg: Config, weights: TransformerWeights) =
 
     let cache_kv pos layer =
         let offset = layer * cfg.dim * cfg.seq_len + pos * cfg.dim
-        k.CopyTo(key_cache.Slice(offset, cfg.dim))
-        v.CopyTo(value_cache.Slice(offset, cfg.dim))
+        let length = cfg.dim
+
+        k.CopyTo(key_cache.Slice(offset, length))
+        v.CopyTo(value_cache.Slice(offset, length))
 
     let rope pos =
         let head_size = cfg.dim / cfg.n_heads
@@ -275,11 +233,13 @@ type RunState(cfg: Config, weights: TransformerWeights) =
         let cis_real = weights.freq_cis_real.Slice(pos * head_size / 2, head_size / 2).Span
         let cis_imag = weights.freq_cis_imag.Slice(pos * head_size / 2, head_size / 2).Span
 
-        for h in 0..cfg.n_heads-1 do
+        let mutable h = 0
+        while h < cfg.n_heads do
             let q' = q.Slice(h * head_size, head_size).Span
             let k' = k.Slice(h * head_size, head_size).Span
 
-            for j in 0..2..head_size-1 do
+            let mutable j = 0
+            while j < head_size do
                 let (q0, q1) = q'[j], q'[j+1]
                 let (k0, k1) = k'[j], k'[j+1]
 
@@ -291,35 +251,60 @@ type RunState(cfg: Config, weights: TransformerWeights) =
                 k'[j] <- k0 * fcr - k1 * fci
                 k'[j+1] <- k0 * fci + k1 * fcr
 
+                j <- j + 2
+
+            h <- h + 1
+
+    let attention_head (q: memory) (xb: memory) (layer_cached_keys: memory) (layer_cached_vals: memory) (att: memory) pos =
+        let head_size = cfg.dim / cfg.n_heads
+
+        let multi = 1f / sqrt(float32 head_size)
+        Parallel.For(0, pos + 1, fun t -> 
+                                    let k = layer_cached_keys.Slice(t * cfg.dim, head_size).Span
+                                    att.Span[t] <- (Vectorized.dot k q.Span) * multi) |> ignore
+
+        inplace_softmax (att.Slice(0, pos+1).Span)
+        xb.Span.Clear()
+
+        let mutable t = 0
+        while t <= pos do
+            let v = layer_cached_vals.Slice(t * head_size * cfg.n_heads, head_size).Span
+            Vectorized.addscaled xb.Span v (att.Span[t])
+            t <- t + 1
+
     let attention pos layer =
         assert (pos < cfg.seq_len)
 
-        let head_size = cfg.dim / cfg.n_heads
-        let layer_cached_keys = key_cache.Slice(layer * cfg.seq_len * cfg.dim, cfg.seq_len * cfg.dim)
-        let layer_cached_vals = value_cache.Slice(layer * cfg.seq_len * cfg.dim, cfg.seq_len * cfg.dim)
+        let length = cfg.seq_len * cfg.dim
+        let layer_cached_keys = key_cache.Slice(layer * length, length)
+        let layer_cached_vals = value_cache.Slice(layer * length, length)
 
-        Parallel.For(0, cfg.n_heads, fun h -> _attention_head
+        let head_size = cfg.dim / cfg.n_heads
+
+        Parallel.For(0, cfg.n_heads, fun h -> attention_head
                                                 (q.Slice(h * head_size, head_size))
                                                 (xb.Slice(h * head_size, head_size))
                                                 (layer_cached_keys.Slice(h * head_size))
                                                 (layer_cached_vals.Slice(h * head_size))
                                                 (att.Slice(h * cfg.seq_len, cfg.seq_len))
-                                                pos
-                                                cfg) |> ignore
+                                                pos) |> ignore
 
     let ffn layer =
         let rms_ffn_w = weights.rms_ffn_weight.Slice(layer * cfg.dim, cfg.dim)
         rmsnorm xb.Span x.Span rms_ffn_w.Span
 
-        let w1 = weights.w1.Slice(cfg.dim * cfg.hidden_dim * layer, cfg.hidden_dim * cfg.dim)
-        let w2 = weights.w2.Slice(cfg.dim * cfg.hidden_dim * layer, cfg.hidden_dim * cfg.dim)
-        let w3 = weights.w3.Slice(cfg.dim * cfg.hidden_dim * layer, cfg.hidden_dim * cfg.dim)
+        let length = cfg.dim * cfg.hidden_dim
+        let w1 = weights.w1.Slice(layer * length, length)
+        let w2 = weights.w2.Slice(layer * length, length)
+        let w3 = weights.w3.Slice(layer * length, length)
 
         matmul hb xb w1
         matmul hb2 xb w3
 
-        for i in 0..hb.Length - 1 do
+        let mutable i = 0
+        while i < hb.Length do
             hb.Span[i] <- hb.Span[i] * (1f / (1f + exp(-hb.Span[i]))) * hb2.Span[i]
+            i <- i + 1
 
         matmul xb hb w2
 
