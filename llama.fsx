@@ -340,7 +340,7 @@ let read_vocab vocab_size path =
         for i in 0..vocab_size-1 ->
             let score = reader.ReadSingle()
             let len = reader.ReadInt32()
-            Text.Encoding.UTF8.GetString(reader.ReadBytes(len))
+            Text.Encoding.UTF8.GetString(reader.ReadBytes(len)), score
     |]
 
 let read_config_and_weights path =
@@ -382,29 +382,56 @@ let read_config_and_weights path =
         wcls = if cfg.shared_weights then Some (read (cfg.vocab_size * cfg.dim)) else None
     }
 
-let cfg, weights = read_config_and_weights @"stories110M.bin"
+let bpe_encode vocab text =
+    let map = vocab |> Array.mapi (fun i (token: string, score: float32) -> token, (score, i)) |> Map.ofArray
+    let score tok = if map |> Map.containsKey tok then fst map[tok] else Single.MinValue
+    let indexOf tok = if map |> Map.containsKey tok then snd map[tok] else -1
+
+    let mutable encoded = [| for c in text -> c.ToString() |]
+    
+    let rec loop () =
+        let bestPair = encoded
+                        |> Array.pairwise
+                        |> Array.mapi (fun i (a, b) -> i, score (a + b), a + b)
+                        |> Array.maxBy (fun (_,scr,_) -> scr)
+
+        let i, scr, tok = bestPair
+        if scr > Single.MinValue then
+            encoded[i] <- tok
+            for j in i+1..encoded.Length-2 do
+                encoded[j] <- encoded[j+1]
+            encoded <- encoded |> Array.take (encoded.Length - 1)
+            loop ()
+
+    loop ()
+    encoded |> Array.map (fun tok -> indexOf tok)
+
+
+let cfg, weights = read_config_and_weights "models/llama-2-7b-chat.bin"//@"stories110M.bin"
 let voc = read_vocab (cfg.vocab_size) @"tokenizer.bin"
 
 let state = RunState(cfg, weights)
 
-let mutable token = 1
+let rec loop token pos (prompt: int array) =
+    state.step token pos
+    let next = if pos < prompt.Length then prompt[pos] else Span.maxi state.out_logits.Span
+    printf "%s" (fst voc[next])
+    
+    if next <> 2 && pos < cfg.seq_len then
+        loop next (pos + 1) prompt
+    else
+        pos
+
 
 #time "on"
 
-let mutable pos = 0
+let prompt = " [INST] What date is today? (I'm in London) [/INST]" |> bpe_encode voc
+
 let watch = System.Diagnostics.Stopwatch.StartNew()
 
-while pos < cfg.seq_len do
-    state.step token pos
-    let next = Span.maxi state.out_logits.Span
-                
-    printf "%s" (voc[next])
-    pos <- pos + 1
-    token <- next
+let pos = loop 1 0 prompt
 
 watch.Stop()
 let ps = double(int64 pos * 1000L) / double(watch.ElapsedMilliseconds)
-
 printfn $"\n {ps} Tokens/Sec"
-
 
