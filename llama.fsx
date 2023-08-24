@@ -402,6 +402,25 @@ module Vocab =
     let index tok vocab = if vocab.map |> Map.containsKey tok then snd vocab.map[tok] else -1
     let symbol i vocab = if i >= 0 && i < vocab.vocab.Length then vocab.vocab[i] else "<unk>"
 
+    let bpe_encode text vocab =
+        let mutable encoded = [| for c in text -> c.ToString() |]
+    
+        let rec loop () =
+            let bestPair = encoded
+                            |> Array.pairwise
+                            |> Array.mapi (fun i (a, b) -> i, vocab |> score (a + b), a + b)
+                            |> Array.maxBy (fun (_,scr,_) -> scr)
+
+            let i, scr, tok = bestPair
+            if scr > Single.MinValue then
+                encoded[i] <- tok
+                Array.Copy(encoded, i + 2, encoded, i + 1, encoded.Length - i - 2)
+                Array.Resize(&encoded, encoded.Length - 1)
+                loop ()
+
+        loop ()
+        encoded |> Array.map (fun tok -> vocab |> index tok) |> List.ofArray
+
 
 let generate pos prompt (state: RunState) =
     let generator (token, pos, prompt) =
@@ -414,35 +433,15 @@ let generate pos prompt (state: RunState) =
 
     Seq.unfold generator (1, pos, prompt)
 
-let bpe_encode vocab text =
-    let mutable encoded = [| for c in text -> c.ToString() |]
-    
-    let rec loop () =
-        let bestPair = encoded
-                        |> Array.pairwise
-                        |> Array.mapi (fun i (a, b) -> i, vocab |> Vocab.score (a + b), a + b)
-                        |> Array.maxBy (fun (_,scr,_) -> scr)
-
-        let i, scr, tok = bestPair
-        if scr > Single.MinValue then
-            encoded[i] <- tok
-            for j in i+1..encoded.Length-2 do
-                encoded[j] <- encoded[j+1]
-            encoded <- encoded |> Array.take (encoded.Length - 1)
-            loop ()
-
-    loop ()
-    encoded |> Array.map (fun tok -> vocab |> Vocab.index tok) |> List.ofArray
-
 type ChatBot(state: RunState, voc) = 
-    let watch = System.Diagnostics.Stopwatch()
+    let watch = Diagnostics.Stopwatch()
     let mutable next_pos = 0
 
     member _.restart () =
         next_pos <- 0
 
     member _.write (text: string) =
-        let prompt = $" [INST] {text} [/INST]" |> bpe_encode voc
+        let prompt = voc |> Vocab.bpe_encode $" [INST] {text} [/INST]"
         let to_symbol tok = voc |> Vocab.symbol tok
 
         let spos = next_pos
@@ -470,17 +469,14 @@ let state = RunState(cfg, weights)
 
 #time "on"
 
-let prompt = " [INST] What date is today? (just the date) [/INST]" |> bpe_encode voc
+let prompt = voc |> Vocab.bpe_encode " [INST] What date is today? (just the date) [/INST]"
 
-let watch = System.Diagnostics.Stopwatch.StartNew()
-
+let watch = Diagnostics.Stopwatch.StartNew()
 state |> generate 0 prompt |> Seq.iter (fun tok -> printf "%s" (voc |> Vocab.symbol tok))
-
 watch.Stop()
 let ps = double(int64 state.pos * 1000L) / double(watch.ElapsedMilliseconds)
 printfn $"\n {ps} Tokens/Sec"
 
-state.pos
 
 //-----------------------------------------------------------------------------------------------------
 
