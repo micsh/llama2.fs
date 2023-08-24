@@ -1,9 +1,13 @@
+#nowarn "3391"
+
 open System
 open System.Numerics
 open System.Threading.Tasks
 
 type span = Span<float32>
+type rospan = ReadOnlySpan<float32>
 type memory = Memory<float32>
+type romemory = ReadOnlyMemory<float32>
 
 // helper functions
 module Vectorized =
@@ -12,7 +16,7 @@ module Vectorized =
 
     let inline (<<<) (out: span) (x: vec) = x.CopyTo(out)
 
-    let inline max (x: span) =
+    let inline max (x: rospan) =
         let len = x.Length
         let mutable max = x[0]
         let mutable MAX = vec(max)
@@ -33,7 +37,7 @@ module Vectorized =
 
         max
 
-    let inline dot (x : span) (w : span) =
+    let inline dot (x : rospan) (w : rospan) =
         let len = x.Length
 
         let mutable result = 0f
@@ -50,7 +54,7 @@ module Vectorized =
         result
 
     /// out = x + y
-    let inline add (out: span) (x: span) (y: span) =
+    let inline add (out: span) (x: rospan) (y: rospan) =
         let len = out.Length
 
         let mutable i = 0
@@ -64,7 +68,7 @@ module Vectorized =
             i <- i + 1
 
     /// out = out + x * k
-    let inline addscaled (out: span) (x: span) (k: float32) =
+    let inline addscaled (out: span) (x: rospan) (k: float32) =
         let len = x.Length
         let mutable i = 0
         while i <= len-vcount do
@@ -91,7 +95,7 @@ module Vectorized =
             i <- i + 1
 
     /// out = x * y
-    let inline mult (out: span) (x: span) (y: span) =
+    let inline mult (out: span) (x: rospan) (y: rospan) =
         let len = out.Length
 
         let mutable i = 0
@@ -105,7 +109,7 @@ module Vectorized =
             i <- i + 1
 
 module Span =
-    let inline maxi (x : span) =
+    let inline maxi (x : rospan) =
         let mutable max = x[0]
         let mutable index = 0
 
@@ -122,12 +126,12 @@ module Span =
 // --------------------------------------------------------------------------------------------------------------
 
 
-let rmsnorm (out: span) (x: span) (w: span) =
+let rmsnorm (out: span) (x: rospan) (w: rospan) =
     let s = 1f / sqrt(1e-5f + (Vectorized.dot x x) / (float32 x.Length))
     Vectorized.mult out x w
     Vectorized.scale out s
 
-let matmul (out: memory) (x: memory) (w: memory) =
+let matmul (out: memory) (x: romemory) (w: romemory) =
     let len = x.Length
     Parallel.For(0, w.Length / len, fun i -> out.Span[i] <- Vectorized.dot x.Span (w.Slice(i * len, len).Span)) |> ignore
 
@@ -157,37 +161,37 @@ type Config = {
 
 type TransformerWeights = {
     /// (vocab_size, dim)
-    token_embedding_table: memory
+    token_embedding_table: romemory
     /// (layer, dim) rmsnorm weights
-    rms_att_weight: memory
+    rms_att_weight: romemory
     /// (layer, dim)
-    rms_ffn_weight: memory
+    rms_ffn_weight: romemory
     // weights for matmuls
     /// (layer, dim, dim)
-    wq: memory
+    wq: romemory
     /// (layer, dim, dim)
-    wk: memory
+    wk: romemory
     /// (layer, dim, dim)
     wv: memory
     /// (layer, dim, dim)
-    wo: memory
+    wo: romemory
     // weights for ffn
     /// (layer, hidden_dim, dim)
-    w1: memory
+    w1: romemory
     /// (layer, dim, hidden_dim)
-    w2: memory
+    w2: romemory
     /// (layer, hidden_dim, dim)
-    w3: memory
+    w3: romemory
     // final rmsnorm
     /// (dim,)
-    rms_final_weight: memory
+    rms_final_weight: romemory
     // freq_cis for RoPE relatively positional embeddings
     /// (seq_len, dim/2)
-    freq_cis_real: memory
+    freq_cis_real: romemory
     /// (seq_len, dim/2)
-    freq_cis_imag: memory
+    freq_cis_imag: romemory
     /// Last layer classifier: (vocab_size, dim)
-    wcls: Option<memory>
+    wcls: Option<romemory>
 }
 
 let allocate size =
@@ -255,7 +259,7 @@ type RunState(cfg: Config, weights: TransformerWeights) =
 
             h <- h + 1
 
-    let attention_head (q: memory) (xb: memory) (layer_cached_keys: memory) (layer_cached_vals: memory) (att: memory) pos =
+    let attention_head (xb: memory) (att: memory) (q: romemory) (layer_cached_keys: romemory) (layer_cached_vals: romemory) pos =
         let head_size = cfg.dim / cfg.n_heads
 
         let multi = 1f / sqrt(float32 head_size)
@@ -282,11 +286,11 @@ type RunState(cfg: Config, weights: TransformerWeights) =
         let head_size = cfg.dim / cfg.n_heads
 
         Parallel.For(0, cfg.n_heads, fun h -> attention_head
-                                                (q.Slice(h * head_size, head_size))
                                                 (xb.Slice(h * head_size, head_size))
+                                                (att.Slice(h * cfg.seq_len, cfg.seq_len))
+                                                (q.Slice(h * head_size, head_size))
                                                 (layer_cached_keys.Slice(h * head_size))
                                                 (layer_cached_vals.Slice(h * head_size))
-                                                (att.Slice(h * cfg.seq_len, cfg.seq_len))
                                                 pos) |> ignore
 
     let ffn layer =
@@ -308,9 +312,13 @@ type RunState(cfg: Config, weights: TransformerWeights) =
 
         matmul xb hb w2
 
+    let mutable last_pos = 0
+    member _.pos = last_pos
+    member _.max_length = cfg.seq_len
     member _.out_logits with get() = logits
 
     member _.step token pos =
+        last_pos <- pos
         weights.token_embedding_table
             .Slice(token * cfg.dim, cfg.dim)
             .CopyTo(x)
@@ -328,20 +336,6 @@ type RunState(cfg: Config, weights: TransformerWeights) =
 
         rmsnorm x.Span x.Span (weights.rms_final_weight.Span)
         matmul logits x (if weights.wcls.IsSome then weights.wcls.Value else weights.token_embedding_table)
-
-
-let read_vocab vocab_size path =
-    use stream = System.IO.File.OpenRead(path)
-    use reader = new System.IO.BinaryReader(stream)
-
-    let max_token_length = reader.ReadInt32()
-
-    [| 
-        for i in 0..vocab_size-1 ->
-            let score = reader.ReadSingle()
-            let len = reader.ReadInt32()
-            Text.Encoding.UTF8.GetString(reader.ReadBytes(len)), score
-    |]
 
 let read_config_and_weights path =
     use stream = System.IO.File.OpenRead(path)
@@ -364,35 +358,69 @@ let read_config_and_weights path =
         memory [| for i in 0..size - 1 -> reader.ReadSingle() |]
 
     let head_size = cfg.dim / cfg.n_heads
+    let layers_dim_size = cfg.n_layers * cfg.dim
 
     cfg, {
         token_embedding_table = read (cfg.vocab_size * cfg.dim)
-        rms_att_weight = read (cfg.n_layers * cfg.dim)
-        wq = read (cfg.n_layers * cfg.dim * cfg.dim)
-        wk = read (cfg.n_layers * cfg.dim * cfg.dim)
-        wv = read (cfg.n_layers * cfg.dim * cfg.dim)
-        wo = read (cfg.n_layers * cfg.dim * cfg.dim)
-        rms_ffn_weight = read (cfg.n_layers * cfg.dim)
-        w1 = read (cfg.n_layers * cfg.dim * cfg.hidden_dim)
-        w2 = read (cfg.n_layers * cfg.dim * cfg.hidden_dim)
-        w3 = read (cfg.n_layers * cfg.dim * cfg.hidden_dim)
-        rms_final_weight = read (cfg.dim)
-        freq_cis_real = read (cfg.seq_len * (head_size / 2))
-        freq_cis_imag = read (cfg.seq_len * (head_size / 2))
+        rms_att_weight = read layers_dim_size
+        wq = read (layers_dim_size * cfg.dim)
+        wk = read (layers_dim_size * cfg.dim)
+        wv = read (layers_dim_size * cfg.dim)
+        wo = read (layers_dim_size * cfg.dim)
+        rms_ffn_weight = read layers_dim_size
+        w1 = read (layers_dim_size * cfg.hidden_dim)
+        w2 = read (layers_dim_size * cfg.hidden_dim)
+        w3 = read (layers_dim_size * cfg.hidden_dim)
+        rms_final_weight = read cfg.dim
+        freq_cis_real = read (cfg.seq_len * head_size / 2)
+        freq_cis_imag = read (cfg.seq_len * head_size / 2)
         wcls = if cfg.shared_weights then Some (read (cfg.vocab_size * cfg.dim)) else None
     }
 
-let bpe_encode vocab text =
-    let map = vocab |> Array.mapi (fun i (token: string, score: float32) -> token, (score, i)) |> Map.ofArray
-    let score tok = if map |> Map.containsKey tok then fst map[tok] else Single.MinValue
-    let indexOf tok = if map |> Map.containsKey tok then snd map[tok] else -1
+type Vocab = {
+    vocab: string[]
+    map: Map<string, float32 * int>
+}
 
+module Vocab =
+    let read_vocab vocab_size path =
+        use stream = System.IO.File.OpenRead(path)
+        use reader = new System.IO.BinaryReader(stream)
+
+        let max_token_length = reader.ReadInt32()
+
+        let vocab = [| 
+            for i in 0..vocab_size-1 ->
+                let score = reader.ReadSingle()
+                let len = reader.ReadInt32()
+                Text.Encoding.UTF8.GetString(reader.ReadBytes(len)), score
+        |]
+
+        { vocab = vocab |> Array.map fst; map = vocab |> Array.mapi (fun i (token: string, score: float32) -> token, (score, i)) |> Map.ofArray }
+
+    let score tok vocab = if vocab.map |> Map.containsKey tok then fst vocab.map[tok] else Single.MinValue
+    let index tok vocab = if vocab.map |> Map.containsKey tok then snd vocab.map[tok] else -1
+    let symbol i vocab = if i >= 0 && i < vocab.vocab.Length then vocab.vocab[i] else "<unk>"
+
+
+let generate pos prompt (state: RunState) =
+    let generator (token, pos, prompt) =
+        if token = 2 || pos >= state.max_length then
+            None
+        else
+            state.step token pos
+            let next = match prompt with | h::t -> h | [] -> Span.maxi state.out_logits.Span 
+            Some(next, (next, pos + 1, (match prompt with | h::t -> t | [] -> prompt)))
+
+    Seq.unfold generator (1, pos, prompt)
+
+let bpe_encode vocab text =
     let mutable encoded = [| for c in text -> c.ToString() |]
     
     let rec loop () =
         let bestPair = encoded
                         |> Array.pairwise
-                        |> Array.mapi (fun i (a, b) -> i, score (a + b), a + b)
+                        |> Array.mapi (fun i (a, b) -> i, vocab |> Vocab.score (a + b), a + b)
                         |> Array.maxBy (fun (_,scr,_) -> scr)
 
         let i, scr, tok = bestPair
@@ -404,34 +432,57 @@ let bpe_encode vocab text =
             loop ()
 
     loop ()
-    encoded |> Array.map (fun tok -> indexOf tok)
+    encoded |> Array.map (fun tok -> vocab |> Vocab.index tok) |> List.ofArray
 
+type ChatBot(state: RunState, voc) = 
+    let watch = System.Diagnostics.Stopwatch()
+    let mutable next_pos = 0
+
+    member _.restart () =
+        next_pos <- 0
+
+    member _.write (text: string) =
+        let prompt = $" [INST] {text} [/INST]" |> bpe_encode voc
+        let to_symbol tok = voc |> Vocab.symbol tok
+
+        let spos = next_pos
+        watch.Restart()
+        if next_pos >= state.max_length then
+            printfn "Reached the end. restart is required"
+        else
+            state |> generate next_pos prompt |> Seq.iter (to_symbol >> printf "%s")
+            next_pos <- state.pos + 1
+
+        watch.Stop()
+        let ps = double(int64 (next_pos - spos) * 1000L) / double(watch.ElapsedMilliseconds)
+        printfn $"\n {ps} Tokens/Sec"
+
+
+
+//-----------------------------------------------------------------------------------------------------
 
 let cfg, weights = read_config_and_weights "models/llama-2-7b-chat.bin"//@"stories110M.bin"
-let voc = read_vocab (cfg.vocab_size) @"tokenizer.bin"
-
+let voc = Vocab.read_vocab (cfg.vocab_size) @"tokenizer.bin"
 let state = RunState(cfg, weights)
 
-let rec loop token pos (prompt: int array) =
-    state.step token pos
-    let next = if pos < prompt.Length then prompt[pos] else Span.maxi state.out_logits.Span
-    printf "%s" (fst voc[next])
-    
-    if next <> 2 && pos < cfg.seq_len then
-        loop next (pos + 1) prompt
-    else
-        pos
 
+//-----------------------------------------------------------------------------------------------------
 
 #time "on"
 
-let prompt = " [INST] What date is today? (I'm in London) [/INST]" |> bpe_encode voc
+let prompt = " [INST] What date is today? (just the date) [/INST]" |> bpe_encode voc
 
 let watch = System.Diagnostics.Stopwatch.StartNew()
 
-let pos = loop 1 0 prompt
+state |> generate 0 prompt |> Seq.iter (fun tok -> printf "%s" (voc |> Vocab.symbol tok))
 
 watch.Stop()
-let ps = double(int64 pos * 1000L) / double(watch.ElapsedMilliseconds)
+let ps = double(int64 state.pos * 1000L) / double(watch.ElapsedMilliseconds)
 printfn $"\n {ps} Tokens/Sec"
 
+state.pos
+
+//-----------------------------------------------------------------------------------------------------
+
+let bot = ChatBot(state, voc)
+bot.write "should it be researchers and not researcher ?"
