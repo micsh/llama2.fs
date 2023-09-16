@@ -10,10 +10,14 @@ type span = Span<float32>
 type rospan = ReadOnlySpan<float32>
 type memory = Memory<float32>
 type romemory = ReadOnlyMemory<float32>
+type cospan = ReadOnlySpan<int16>
+type comemory = ReadOnlyMemory<int16>
 
 // helper functions
 module Vectorized =
-    type vec = Vector<float32>
+    type Vec = Vector
+    type vec<'a> = Vector<'a>
+    type vec = vec<float32>
     let vcount = vec.Count
 
     let inline (<<<) (out: span) (x: vec) = x.CopyTo(out)
@@ -26,7 +30,7 @@ module Vectorized =
         let mutable i = 0
         if len >= vcount then
             while i <= len-vcount do
-               MAX <- Vector.Max(vec(x.Slice(i)), MAX)
+               MAX <- Vec.Max(vec(x.Slice(i)), MAX)
                i <- i + vcount
 
             for j in 0..vcount-1 do
@@ -46,7 +50,7 @@ module Vectorized =
         let mutable result = 0f
         let mutable i = 0
         while i <= len-vcount do
-            result <- result + Vector.Dot(vec(x.Slice(i)), vec(w.Slice(i)))
+            result <- result + Vec.Dot(vec(x.Slice(i)), vec(w.Slice(i)))
             i <- i + vcount
     
         i <- len-len%vcount
@@ -55,6 +59,40 @@ module Vectorized =
             i <- i + 1
 
         result
+
+    let inline unpack (v: vec<int16>) =
+        let a, b = Vec.Widen v
+        struct(Vec.AsVectorSingle(Vec.ShiftLeft(a, 16)), Vec.AsVectorSingle(Vec.ShiftLeft(b, 16)))
+
+    let inline codot (x : rospan) (w : cospan) =
+        assert(x.Length = w.Length)
+
+        let X = MemoryMarshal.Cast<float32, vec>(x)
+        let W = MemoryMarshal.Cast<int16, vec<int16>>(w)
+
+        let mutable result = 0f
+        let mutable i = 0
+        while i < X.Length do
+            let struct(v1, v2) = unpack W[i / 2]
+            result <- result + Vec.Dot(X[i], v1) + Vec.Dot(X[i + 1], v2)
+            i <- i + 2
+    
+        result
+
+    let inline copy (out: span) (x: cospan) =
+        assert(x.Length = out.Length)
+
+        let X = MemoryMarshal.Cast<int16, vec<int16>>(x)
+
+        let mutable i = 0
+        while i < X.Length do
+            let struct(v1, v2) = unpack X[i]
+
+            v1.CopyTo(out.Slice(i * 2 * vcount))
+            v2.CopyTo(out.Slice(i * 2 * vcount + vcount))
+
+            i <- i + 1
+
 
     /// out = x + y
     let inline add (out: span) (x: rospan) (y: rospan) =
@@ -189,32 +227,32 @@ type Config = {
 
 type TransformerWeights = {
     /// (vocab_size, dim)
-    token_embedding_table: romemory
+    token_embedding_table: comemory
     /// (layer, dim) rmsnorm weights
     rms_att_weight: romemory
-    /// (layer, dim)
-    rms_ffn_weight: romemory
     // weights for matmuls
     /// (layer, dim, dim)
-    wq: romemory
+    wq: comemory
     /// (layer, dim, dim)
-    wk: romemory
+    wk: comemory
     /// (layer, dim, dim)
-    wv: romemory
+    wv: comemory
     /// (layer, dim, dim)
-    wo: romemory
+    wo: comemory
+    /// (layer, dim)
+    rms_ffn_weight: romemory
     // weights for ffn
     /// (layer, hidden_dim, dim)
-    w1: romemory
+    w1: comemory
     /// (layer, dim, hidden_dim)
-    w2: romemory
+    w2: comemory
     /// (layer, hidden_dim, dim)
-    w3: romemory
+    w3: comemory
     // final rmsnorm
     /// (dim,)
     rms_final_weight: romemory
     /// Last layer classifier: (vocab_size, dim)
-    wcls: romemory
+    wcls: comemory
 }
 
 let read_config_and_weights path =
@@ -234,36 +272,43 @@ let read_config_and_weights path =
                 | c when c.vocab_size >= 0 -> c 
                 | c -> { c with vocab_size = -c.vocab_size; shared_weights = true }
 
-    let read size =
-        let floats = Array.zeroCreate<float32>(size)
+    let read_into (dest: _ array) = 
         let maxChunkSize = Int32.MaxValue / 4
-        let times, remainder = floats.Length / maxChunkSize, floats.Length % maxChunkSize
+        let times, remainder = dest.Length / maxChunkSize, dest.Length % maxChunkSize
 
         for i in 0..times-1 do
-            let bytes = MemoryMarshal.AsBytes(floats.AsSpan(i * maxChunkSize, maxChunkSize))
+            let bytes = MemoryMarshal.AsBytes(dest.AsSpan(i * maxChunkSize, maxChunkSize))
             reader.Read(bytes) |> ignore
 
-        let bytes = MemoryMarshal.AsBytes(floats.AsSpan(times * maxChunkSize, remainder))
+        let bytes = MemoryMarshal.AsBytes(dest.AsSpan(times * maxChunkSize, remainder))
         reader.Read(bytes) |> ignore
 
+    let read size =
+        let floats = Array.zeroCreate<float32>(size)
+        read_into floats
         memory floats
+    
+    let readco size =
+        let shorts = Array.zeroCreate<int16>(size)
+        read_into shorts
+        comemory shorts
 
     let layers_dim_size = cfg.n_layers * cfg.dim
-    let token_embedding_table = read (cfg.vocab_size * cfg.dim)
+    let token_embedding_table = readco (cfg.vocab_size * cfg.dim)
 
     cfg, {
         token_embedding_table = token_embedding_table
         rms_att_weight = read layers_dim_size
-        wq = read (layers_dim_size * cfg.dim)
-        wk = read (layers_dim_size * cfg.dim)
-        wv = read (layers_dim_size * cfg.dim)
-        wo = read (layers_dim_size * cfg.dim)
+        wq = readco (layers_dim_size * cfg.dim)
+        wk = readco (layers_dim_size * cfg.dim)
+        wv = readco (layers_dim_size * cfg.dim)
+        wo = readco (layers_dim_size * cfg.dim)
         rms_ffn_weight = read layers_dim_size
-        w1 = read (layers_dim_size * cfg.hidden_dim)
-        w2 = read (layers_dim_size * cfg.hidden_dim)
-        w3 = read (layers_dim_size * cfg.hidden_dim)
+        w1 = readco (layers_dim_size * cfg.hidden_dim)
+        w2 = readco (layers_dim_size * cfg.hidden_dim)
+        w3 = readco (layers_dim_size * cfg.hidden_dim)
         rms_final_weight = read cfg.dim
-        wcls = if cfg.shared_weights then read (cfg.vocab_size * cfg.dim) else token_embedding_table
+        wcls = if cfg.shared_weights then readco (cfg.vocab_size * cfg.dim) else token_embedding_table
     }
 
 // --------------------------------------------------------------------------------------------------------------
@@ -272,10 +317,10 @@ let rmsnorm (out: memory) (x: romemory) (w: romemory) =
     let s = 1f / sqrt(1e-5f + (Vectorized.dot x.Span x.Span) / (float32 x.Length))
     Vectorized.mult out.Span x.Span w.Span s
 
-let matmul (out: memory) (x: romemory) (w: romemory) =
+let matmul (out: memory) (x: romemory) (w: comemory) =
     assert(out.Length = w.Length / x.Length)
     let len = x.Length
-    Parallel.For(0, out.Length, fun i -> out.Span[i] <- Vectorized.dot x.Span (w.Slice(i * len, len).Span)) |> ignore
+    Parallel.For(0, out.Length, fun i -> out.Span[i] <- Vectorized.codot x.Span (w.Slice(i * len, len).Span)) |> ignore
 
 let inplace_softmax (x: span) =
     let maxx = Vectorized.max x
@@ -290,7 +335,11 @@ let inplace_softmax (x: span) =
     Vectorized.scale x (1f / denom)
 
 type RunState(cfg: Config, weights: TransformerWeights) = 
-    let forLayer layer (weights: romemory) = 
+    let forLayer layer (weights: comemory) = 
+        let len = weights.Length / cfg.n_layers
+        weights.Slice(len * layer, len)
+
+    let rmsForLayer layer (weights: romemory) = 
         let len = weights.Length / cfg.n_layers
         weights.Slice(len * layer, len)
 
@@ -382,7 +431,7 @@ type RunState(cfg: Config, weights: TransformerWeights) =
                                                 (layer_cached_vals.Slice(h * head_size))) |> ignore
 
     let ffn layer =
-        rmsnorm xb x (weights.rms_ffn_weight |> forLayer layer)
+        rmsnorm xb x (weights.rms_ffn_weight |> rmsForLayer layer)
 
         matmul hb xb (weights.w1 |> forLayer layer)
         matmul hb2 xb (weights.w3 |> forLayer layer)
@@ -401,12 +450,10 @@ type RunState(cfg: Config, weights: TransformerWeights) =
 
     member _.step token pos =
         last_pos <- pos
-        weights.token_embedding_table
-            .Slice(token * cfg.dim, cfg.dim)
-            .CopyTo(x)
+        Vectorized.copy x.Span (weights.token_embedding_table.Slice(token * cfg.dim, cfg.dim).Span)
 
         for layer in 0..cfg.n_layers-1 do
-            rmsnorm xb x (weights.rms_att_weight |> forLayer layer)
+            rmsnorm xb x (weights.rms_att_weight |> rmsForLayer layer)
             qkv_for_layer layer
             rope pos
             cache_kv pos layer
@@ -458,7 +505,7 @@ type ChatBot(state: RunState, voc) =
 
 //-----------------------------------------------------------------------------------------------------
 
-let cfg, weights = read_config_and_weights @"../../CodeLlama-7b-Instruct.bin"//"../../stories110M.bin"//
+let cfg, weights = read_config_and_weights "../../CodeLlama-7b-Instruct-short.bin"//@"../../CodeLlama-7b-Instruct.bin"//"../../stories110M.bin"//
 let vocab = Vocab.read_vocab cfg.vocab_size @"../../tokenizer.bin"
 let state = RunState(cfg, weights)
 
@@ -466,56 +513,10 @@ let state = RunState(cfg, weights)
 
 #time "on"
 
-let readCodeLines st en =
-    let lines = File.ReadAllLines(@"llama.fsx")[st..en]
-    "\n```\n" + (lines |> String.concat "\n") + "\n```\n"
+//let readCodeLines st en =
+//    let lines = File.ReadAllLines(@"llama.fsx")[st..en]
+//    "\n```\n" + (lines |> String.concat "\n") + "\n```\n"
     
 let bot = ChatBot(state, vocab)
 bot.chat "Hi"
-
-//"You're job is to help reduce the numbers of tokens, while retaining contextual information !
-//* New tokens should replace existing tokens from the start, and retain the final tokens as they are.
-//* The tokens will be presented immediately following the instructions.
-
-//<s>[INST] As an expert in the field, can you figure out how to replace tokens at the start of your short term memory with fewer tokens that keep the relevant information to the rest of the conversation? [/INST]  As an AI language model, I can provide some insights on how to optimize the use of tokens in short-term memory for conversational AI systems. Here are some strategies that can help reduce the number of tokens required to retain relevant information during a conversation:
-
-//1. Use a hierarchical tokenization approach: Instead of treating each token as an independent unit, group related tokens into hierarchical categories. For example, in a conversation about a restaurant, you could group tokens related to the restaurant's name, location, and cuisine into separate categories. This can help reduce the overall number of tokens required to retain relevant information.
-//2. Apply context-dependent tokenization: Tokenize the conversation based on the context of the conversation. For instance, in a conversation about a specific topic, you could tokenize related tokens based on the topic, such as separating tokens related to the topic's definition, examples, and applications.
-//3. Use a hybrid tokenization approach: Combine both hierarchical and context-dependent tokenization approaches to create a hybrid tokenization system. This can help capture both the structural and contextual information in the conversation.
-//4. Use a smaller set of core tokens: Instead of using a large set of tokens to represent each concept, use a smaller set of core tokens that can be combined to represent more complex ideas. For example, in a conversation about a movie, you could use a smaller set of core tokens to represent the movie's title, director, genre, and plot.
-//5. Use a token pruning approach: As the conversation progresses, prune out tokens that are no longer relevant or useful. This can help reduce the overall number of tokens required to retain relevant information.
-//6. Use a memory-based approach: Instead of relying solely on tokenization, use a memory-based approach to store and retrieve relevant information. This can help reduce the overall number of tokens required to retain relevant information by leveraging the memory of the system.
-//7. Use a transfer learning approach: If possible, use a transfer learning approach to leverage pre-trained models and fine-tune them for the specific conversation task at hand. This can help reduce the overall number of tokens required to retain relevant information by leveraging the knowledge learned from similar conversations.
-//8. Use a multi-modal representation: Instead of relying solely on textual tokens, use a multi-modal representation that incorporates other modalities such as speech, vision, or even physiological signals. This can help reduce the overall number of tokens required to retain relevant information by leveraging the complementary information from other modalities.
-//9. Use a generative model: Use a generative model, such as a Generative Adversarial Network (GAN) or Variational Autoencoder (VAE), to generate new tokens based on the existing ones. This can help reduce the overall number of tokens required to retain relevant information by generating new tokens that are similar to the existing ones.
-//10. Use a reinforcement learning approach: Use a reinforcement learning approach to learn the optimal tokenization strategy based on the feedback from the conversation. This can help reduce the overall number of tokens required to retain relevant information by learning the most effective tokenization strategy for the specific conversation task at hand.
-
-//By applying these strategies, you can reduce the number of tokens required to retain relevant information during a conversation while still maintaining the accuracy and relevance of the information being retained.
-//</s>"
-//You can ask me for the list of files and their sizes by typing '[please provide list of files]' or '[get length of *filename]' and you can ask me for their content by '[get content of *filename]' or '[get content of *filename from offset x with length y]'):\n")
-
-//bot.chat "Here's the list of files:\n\
-//tokenizer.bin
-//tokenizer.model
-//"
-
-//bot.chat "Here are lengths:\n\
-//423KB
-//489KB
-//"
-
-//bot.chat "Here's the content for tokenizer.bin:\n\
-//let rmsnorm (out: span) (x: rospan) (w: rospan) =
-//    let s = 1f / sqrt(1e-5f + (Vectorized.dot x x) / (float32 x.Length))
-//    Vectorized.mult out x w
-//    Vectorized.scale out s
-//"
-
-
-//bot.chat "Here's the content for tokenizer.model:\n\
-//let matmul (out: memory) (x: romemory) (w: romemory) =
-//    assert(out.Length = w.Length / x.Length)
-//    let len = x.Length
-//    Parallel.For(0, out.Length, fun i -> out.Span[i] <- Vectorized.dot x.Span (w.Slice(i * len, len).Span)) |> ignore
-//"
 
